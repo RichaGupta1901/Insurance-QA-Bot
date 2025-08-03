@@ -10,7 +10,7 @@ import io
 import logging
 from datetime import datetime
 import hashlib
-import time
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -87,7 +87,73 @@ class Response(BaseModel):
     document_info: Dict[str, Any]
     processing_summary: Dict[str, Any]
 
-def extract_pdf_content_from_file(file_content: bytes, filename: str) -> tuple[str, Dict[str, Any]]:
+def extract_pdf_content(url: str) -> tuple[str, Dict[str, Any]]:
+    """Extract text content from PDF URL with metadata"""
+    try:
+        logger.info(f"Downloading PDF from: {url}")
+        
+        # Download with timeout and proper headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        pdf_response = requests.get(
+            str(url), 
+            headers=headers, 
+            timeout=REQUEST_TIMEOUT,
+            stream=True
+        )
+        pdf_response.raise_for_status()
+        
+        # Check content type
+        content_type = pdf_response.headers.get('content-type', '')
+        if 'pdf' not in content_type.lower():
+            logger.warning(f"Unexpected content type: {content_type}")
+        
+        # Extract PDF content
+        pdf_reader = PdfReader(io.BytesIO(pdf_response.content))
+        
+        # Extract text from all pages
+        pages_text = []
+        for i, page in enumerate(pdf_reader.pages):
+            try:
+                text = page.extract_text() or ""
+                pages_text.append(text)
+            except Exception as e:
+                logger.warning(f"Error extracting text from page {i+1}: {e}")
+                pages_text.append("")
+        
+        full_text = "\n".join(pages_text)
+        
+        # Document metadata
+        doc_info = {
+            "total_pages": len(pdf_reader.pages),
+            "original_length": len(full_text),
+            "content_hash": hashlib.md5(full_text.encode()).hexdigest()[:8],
+            "extracted_at": datetime.utcnow().isoformat()
+        }
+        
+        # Truncate if necessary
+        if len(full_text) > MAX_TEXT_LENGTH:
+            full_text = full_text[:MAX_TEXT_LENGTH]
+            doc_info["truncated"] = True
+            doc_info["truncated_length"] = MAX_TEXT_LENGTH
+            logger.info(f"Text truncated to {MAX_TEXT_LENGTH} characters")
+        else:
+            doc_info["truncated"] = False
+        
+        return full_text, doc_info
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to download document: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Document parsing failed: {str(e)}"
+        )
     """Extract text content from uploaded PDF file with metadata"""
     try:
         logger.info(f"Processing uploaded PDF: {filename}")
@@ -225,6 +291,11 @@ async def root():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+@app.head("/")
+async def root_head():
+    """Health check HEAD endpoint for Render"""
+    return
+
 @app.get("/health")
 async def health_check():
     """Detailed health check"""
@@ -235,6 +306,47 @@ async def health_check():
         "max_text_length": MAX_TEXT_LENGTH,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+@app.post("/hackrx/run")
+async def run_hackrx(request: RequestBody, authorization: Optional[str] = Header(None)):
+    """
+    Process insurance document from URL and answer questions - COMPETITION ENDPOINT
+    
+    - *documents*: Public URL to the PDF document
+    - *questions*: List of questions to answer (max 10)
+    """
+    start_time = time.time()
+    
+    # Validate authorization header (if provided)
+    if authorization and not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header. Use 'Bearer <token>'"
+        )
+    
+    logger.info(f"Processing request with {len(request.questions)} questions")
+    
+    # Extract PDF content from URL
+    document_text, doc_info = extract_pdf_content(request.documents)
+    
+    # Process each question
+    answers = []
+    total_llm_time = 0
+    
+    for i, question in enumerate(request.questions):
+        logger.info(f"Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
+        
+        answer_text, processing_time = query_llm_with_retry(question, document_text)
+        total_llm_time += processing_time
+        
+        answers.append(answer_text)  # Competition expects simple string array
+    
+    total_time = int((time.time() - start_time) * 1000)
+    
+    logger.info(f"Request completed in {total_time}ms")
+    
+    # Return simple format as expected by competition
+    return {"answers": answers}
 
 @app.post("/hackrx/upload", response_model=Response)
 async def run_hackrx_upload(
@@ -267,7 +379,6 @@ async def run_hackrx_upload(
     
     # Parse questions from JSON string
     try:
-        import json
         questions_list = json.loads(questions)
         if not isinstance(questions_list, list):
             raise ValueError("Questions must be a list")
@@ -359,10 +470,11 @@ async def global_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",
-        host="127.0.0.1",  # Changed to localhost
-        port=8000,
-        reload=True,
+        host="0.0.0.0",  # This must be 0.0.0.0 for Render
+        port=port,
+        reload=False,  # Disable reload for production
         log_level="info"
     )
