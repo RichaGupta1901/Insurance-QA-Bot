@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Header, HTTPException, status, File, UploadFile, Form
+from fastapi import FastAPI, Header, HTTPException, status, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, field_validator
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, HttpUrl, field_validator, ValidationError
 from typing import List, Optional, Dict, Any
 import os
 from dotenv import load_dotenv
@@ -11,11 +13,12 @@ import logging
 from datetime import datetime
 import hashlib
 import json
-import time  # ADDED: Missing import
+import time
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)  
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -88,6 +91,40 @@ class Response(BaseModel):
     document_info: Dict[str, Any]
     processing_summary: Dict[str, Any]
 
+# Custom exception handlers
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors with detailed messages"""
+    logger.error(f"Validation error on {request.method} {request.url}: {exc}")
+    
+    # Extract the first error for a cleaner response
+    first_error = exc.errors()[0] if exc.errors() else {}
+    field = " -> ".join(str(loc) for loc in first_error.get("loc", []))
+    message = first_error.get("msg", "Validation error")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "Validation Error",
+            "message": f"Invalid {field}: {message}",
+            "details": exc.errors()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler for better error responses"""
+    logger.error(f"Unhandled exception on {request.method} {request.url}: {exc}", exc_info=True)
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "message": "An internal server error occurred",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
 def extract_pdf_content(url: str) -> tuple[str, Dict[str, Any]]:
     """Extract text content from PDF URL with metadata"""
     try:
@@ -140,11 +177,13 @@ def extract_pdf_content(url: str) -> tuple[str, Dict[str, Any]]:
         return full_text, doc_info
         
     except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download document: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to download document: {str(e)}"
         )
     except Exception as e:
+        logger.error(f"Document parsing failed: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Document parsing failed: {str(e)}"
@@ -188,6 +227,7 @@ def extract_pdf_content_from_file(file_content: bytes, filename: str) -> tuple[s
         return full_text, doc_info
         
     except Exception as e:
+        logger.error(f"PDF parsing failed: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"PDF parsing failed: {str(e)}"
@@ -307,35 +347,45 @@ async def run_hackrx(request: RequestBody, authorization: Optional[str] = Header
     """
     start_time = time.time()
     
-    if authorization and not authorization.lower().startswith("bearer "):
+    try:
+        if authorization and not authorization.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authorization header. Use 'Bearer <token>'"
+            )
+        
+        logger.info(f"Processing request with {len(request.questions)} questions")
+        
+        # Extract PDF content from URL
+        document_text, doc_info = extract_pdf_content(request.documents)
+        
+        # Process each question
+        answers = []
+        total_llm_time = 0
+        
+        for i, question in enumerate(request.questions):
+            logger.info(f"Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
+            
+            answer_text, processing_time = query_llm_with_retry(question, document_text)
+            total_llm_time += processing_time
+            
+            answers.append(answer_text)  # Competition expects simple string array
+        
+        total_time = int((time.time() - start_time) * 1000)
+        
+        logger.info(f"Request completed in {total_time}ms")
+        
+        # Return simple format as expected by competition
+        return {"answers": answers}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in /hackrx/run: {e}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header. Use 'Bearer <token>'"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while processing your request"
         )
-    
-    logger.info(f"Processing request with {len(request.questions)} questions")
-    
-    # Extract PDF content from URL
-    document_text, doc_info = extract_pdf_content(request.documents)
-    
-    # Process each question
-    answers = []
-    total_llm_time = 0
-    
-    for i, question in enumerate(request.questions):
-        logger.info(f"Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
-        
-        answer_text, processing_time = query_llm_with_retry(question, document_text)
-        total_llm_time += processing_time
-        
-        answers.append(answer_text)  # Competition expects simple string array
-    
-    total_time = int((time.time() - start_time) * 1000)
-    
-    logger.info(f"Request completed in {total_time}ms")
-    
-    # Return simple format as expected by competition
-    return {"answers": answers}
 
 @app.post("/hackrx/upload", response_model=Response)
 async def run_hackrx_upload(
@@ -351,107 +401,107 @@ async def run_hackrx_upload(
     """
     start_time = time.time()
     
-    if authorization and not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header. Use 'Bearer <token>'"
-        )
-    
-    if not file.content_type or 'pdf' not in file.content_type.lower():
-        if not file.filename or not file.filename.lower().endswith('.pdf'):
+    try:
+        if authorization and not authorization.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authorization header. Use 'Bearer <token>'"
+            )
+        
+        if not file.content_type or 'pdf' not in file.content_type.lower():
+            if not file.filename or not file.filename.lower().endswith('.pdf'):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Only PDF files are supported"
+                )
+        
+        try:
+            questions_list = json.loads(questions)
+            if not isinstance(questions_list, list):
+                raise ValueError("Questions must be a list")
+        except (json.JSONDecodeError, ValueError) as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only PDF files are supported"
+                detail=f"Invalid questions format. Use JSON array: {str(e)}"
             )
-    
-    try:
-        questions_list = json.loads(questions)
-        if not isinstance(questions_list, list):
-            raise ValueError("Questions must be a list")
-    except (json.JSONDecodeError, ValueError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid questions format. Use JSON array: {str(e)}"
-        )
-    
-    try:
-        FileRequestBody(questions=questions_list)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    
-    logger.info(f"Processing uploaded file: {file.filename} with {len(questions_list)} questions")
-    
-    try:
-        file_content = await file.read()
-        if len(file_content) == 0:
+        
+        try:
+            FileRequestBody(questions=questions_list)
+        except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Uploaded file is empty"
+                detail=str(e)
             )
+        
+        logger.info(f"Processing uploaded file: {file.filename} with {len(questions_list)} questions")
+        
+        try:
+            file_content = await file.read()
+            if len(file_content) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Uploaded file is empty"
+                )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to read uploaded file: {str(e)}"
+            )
+        
+        # Extract PDF content
+        document_text, doc_info = extract_pdf_content_from_file(file_content, file.filename)
+        
+        # Process each question
+        answers = []
+        total_llm_time = 0
+        
+        for i, question in enumerate(questions_list):
+            logger.info(f"Processing question {i+1}/{len(questions_list)}: {question[:50]}...")
+            
+            answer_text, processing_time = query_llm_with_retry(question, document_text)
+            total_llm_time += processing_time
+            
+            confidence = "high"
+            if "not found" in answer_text.lower() or "error" in answer_text.lower():
+                confidence = "low"
+            elif len(answer_text) < 20:
+                confidence = "medium"
+            
+            answers.append(Answer(
+                question=question,
+                answer=answer_text,
+                confidence=confidence,
+                processing_time_ms=processing_time
+            ))
+        
+        total_time = int((time.time() - start_time) * 1000)
+        
+        processing_summary = {
+            "total_processing_time_ms": total_time,
+            "llm_processing_time_ms": total_llm_time,
+            "questions_processed": len(questions_list),
+            "model_used": MODEL,
+            "processed_at": datetime.utcnow().isoformat()
+        }
+        
+        logger.info(f"Upload request completed in {total_time}ms")
+        
+        return Response(
+            answers=answers,
+            document_info=doc_info,
+            processing_summary=processing_summary
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Unexpected error in /hackrx/upload: {e}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to read uploaded file: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while processing your request"
         )
-    
-    # Extract PDF content
-    document_text, doc_info = extract_pdf_content_from_file(file_content, file.filename)
-    
-    # Process each question
-    answers = []
-    total_llm_time = 0
-    
-    for i, question in enumerate(questions_list):
-        logger.info(f"Processing question {i+1}/{len(questions_list)}: {question[:50]}...")
-        
-        answer_text, processing_time = query_llm_with_retry(question, document_text)
-        total_llm_time += processing_time
-        
-        confidence = "high"
-        if "not found" in answer_text.lower() or "error" in answer_text.lower():
-            confidence = "low"
-        elif len(answer_text) < 20:
-            confidence = "medium"
-        
-        answers.append(Answer(
-            question=question,
-            answer=answer_text,
-            confidence=confidence,
-            processing_time_ms=processing_time
-        ))
-    
-    total_time = int((time.time() - start_time) * 1000)
-    
-    processing_summary = {
-        "total_processing_time_ms": total_time,
-        "llm_processing_time_ms": total_llm_time,
-        "questions_processed": len(questions_list),
-        "model_used": MODEL,
-        "processed_at": datetime.utcnow().isoformat()
-    }
-    
-    logger.info(f"Upload request completed in {total_time}ms")
-    
-    return Response(
-        answers=answers,
-        document_info=doc_info,
-        processing_summary=processing_summary
-    )
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    """Global exception handler for better error responses"""
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
-    
-    return HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail="An internal server error occurred"
-    )
-
-if __name__ == "__main__":  
+if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
